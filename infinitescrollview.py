@@ -1,12 +1,15 @@
+from functools import partial
+
 from kivy.app import App
-from kivy.logger import Logger
+from kivy.clock import Clock
+from kivy.compat import iteritems
+from kivy.lang import Builder
+from kivy.metrics import sp
+from kivy.properties import DictProperty, ListProperty, NumericProperty, BooleanProperty, ObjectProperty
+from kivy.uix.label import Label
 from kivy.uix.relativelayout import RelativeLayout
 from kivy.uix.stencilview import StencilView
-from kivy.lang import Builder
 from kivy.uix.widget import Widget
-from kivy.uix.label import Label
-from kivy.properties import DictProperty, ListProperty, NumericProperty, BooleanProperty, ObjectProperty
-from kivy.compat import iteritems
 
 
 class LoopEntry(Widget):
@@ -101,6 +104,18 @@ class LoopScrollView(RelativeLayout):
     """
     debug = BooleanProperty(False)
 
+    """
+    scroll timeout. If the mouse has not been moved 'scroll_distance' within this time, dispatch the touch to children
+    in milliseconds
+    """
+    scroll_timeout = NumericProperty(200)
+
+    """
+    touch distance. Distance mouse needs to be moved
+    in pixel
+    """
+    scroll_distance = NumericProperty('20dp')
+
     def __init__(self, **kwargs):
         """
 
@@ -111,17 +126,14 @@ class LoopScrollView(RelativeLayout):
         self.__minimum_widgets = 0
 
         # controls overscroll blocking if loop is disabled
-        self.__overscroll_block = "free"
-
-        # mouse pos to calculate mouse delta
-        self._last_mouse_pos = [0, 0]
+        self.__overscroll_block_y = "free"
 
         # container
         _kwargs = {
             "size_hint": (None, None),
             "size": (0, 0)
         }
-        self.container = LoopContainer(**_kwargs) if not self.debug else LoopContainerDebug(**_kwargs)
+        self.container = LoopContainer(**_kwargs) if not kwargs.get('debug', False) else LoopContainerDebug(**_kwargs)
 
         # init super values
         super(LoopScrollView, self).__init__(**kwargs)
@@ -131,6 +143,9 @@ class LoopScrollView(RelativeLayout):
 
         # create widgets
         self.__create_widgets()
+
+        # no idea
+        self._drag_touch = None
 
     def on_pos(self, widget, value) -> None:
         """
@@ -290,7 +305,7 @@ class LoopScrollView(RelativeLayout):
                 self.scroll_y(1 if entry.y < 0 else -1)
 
             # set overscroll AFTER scrolling
-            self.__overscroll_block = "bottom"
+            self.__overscroll_block_y = "bottom"
 
         # for up
         elif state == "top" and entry is not None:
@@ -300,12 +315,12 @@ class LoopScrollView(RelativeLayout):
                 self.scroll_y(1 if entry.y < self.height - entry.height else 1)
 
             # set overscroll AFTER scrolling
-            self.__overscroll_block = "top"
+            self.__overscroll_block_y = "top"
 
         # reset else
         else:
             # free scrolling
-            self.__overscroll_block = "free"
+            self.__overscroll_block_y = "free"
 
     def __update_entry(self, entry: LoopEntry, direction) -> None:
         """
@@ -446,36 +461,109 @@ class LoopScrollView(RelativeLayout):
             _lowest.y = _highest.y + _highest.height
             self.__update_entry(_lowest, direction="up")
 
+    def _get_uid(self, prefix='sv'):
+        return '{0}.{1}'.format(prefix, self.uid)
+
     def on_touch_down(self, touch):
-        if touch.button == 'right':
-            self.loop = not self.loop
-            return
+        x, y = touch.pos
 
-        if self.collide_point(*touch.pos):
-            touch.grab(self)
-            self._last_mouse_pos = touch.pos
-            return True
+        if not self.collide_point(x, y):
+            touch.ud[self._get_uid('svavoid')] = True
+            return super(LoopScrollView, self).on_touch_down(touch)
 
-        return super(LoopScrollView, self).on_touch_down(touch)
+        if self._drag_touch or ('button' in touch.profile and touch.button.startswith('scroll')):
+            return super(LoopScrollView, self).on_touch_down(touch)
+
+        # no mouse scrolling, so the user is going to drag with this touch.
+        self._drag_touch = touch
+        uid = self._get_uid()
+        touch.grab(self)
+        touch.ud[uid] = {
+            'mode': 'unknown',
+            'dx': 0,
+            'dy': 0
+        }
+        Clock.schedule_once(self._change_touch_mode, self.scroll_timeout / 1000.)
+        return True
 
     def on_touch_move(self, touch):
-        if touch.grab_current == self:
-            delta_x = touch.pos[0] - self._last_mouse_pos[0]
-            delta_y = touch.pos[1] - self._last_mouse_pos[1]
+        if self._get_uid('svavoid') in touch.ud or self._drag_touch is not touch:
+            return super(LoopScrollView, self).on_touch_move(touch) or self._get_uid() in touch.ud
 
-            if delta_y > 0 and self.__overscroll_block == "bottom" or delta_y < 0 and self.__overscroll_block == "top":
-                return
-            else:
-                self.scroll_y(delta_y)
-
-            self._last_mouse_pos = touch.pos
-
-    def on_touch_up(self, touch):
-        if self.collide_point(*touch.pos):
-            touch.ungrab(self)
+        if touch.grab_current is not self:
             return True
 
-        return super(LoopScrollView, self).on_touch_up(touch)
+        uid = self._get_uid()
+        ud = touch.ud[uid]
+        mode = ud['mode']
+
+        if mode == 'unknown':
+            ud['dx'] += abs(touch.dx)
+            ud['dy'] += abs(touch.dy)
+
+            if ud['dx'] > sp(self.scroll_distance):
+                mode = 'drag'
+            if ud['dy'] > sp(self.scroll_distance):
+                mode = 'drag'
+
+            ud['mode'] = mode
+
+        if mode == 'drag':
+            if (touch.dy > 0 and self.__overscroll_block_y == "bottom" or
+                    touch.dy < 0 and self.__overscroll_block_y == "top"):
+                pass
+            else:
+                self.scroll_y(touch.dy)
+
+        return True
+
+    def on_touch_up(self, touch):
+        if self._get_uid('svavoid') in touch.ud:
+            return super(LoopScrollView, self).on_touch_up(touch)
+
+        if self._drag_touch and self in [x() for x in touch.grab_list]:
+            touch.ungrab(self)
+            self._drag_touch = None
+            ud = touch.ud[self._get_uid()]
+
+            if ud['mode'] == 'unknown':
+                super(LoopScrollView, self).on_touch_down(touch)
+                Clock.schedule_once(partial(self._do_touch_up, touch), .1)
+        else:
+            if self._drag_touch is not touch:
+                super(LoopScrollView, self).on_touch_up(touch)
+
+        return self._get_uid() in touch.ud
+
+    def _do_touch_up(self, touch, *largs):
+        super(LoopScrollView, self).on_touch_up(touch)
+        # don't forget about grab event!
+        for x in touch.grab_list[:]:
+            touch.grab_list.remove(x)
+            x = x()
+            if not x:
+                continue
+            touch.grab_current = x
+            super(LoopScrollView, self).on_touch_up(touch)
+        touch.grab_current = None
+
+    def _change_touch_mode(self, *largs):
+        if not self._drag_touch:
+            return
+
+        uid = self._get_uid()
+        touch = self._drag_touch
+        ud = touch.ud[uid]
+
+        if ud['mode'] != 'unknown':
+            return
+        touch.ungrab(self)
+        self._drag_touch = None
+        touch.push()
+        touch.apply_transform_2d(self.parent.to_widget)
+        super(LoopScrollView, self).on_touch_down(touch)
+        touch.pop()
+        return
 
 
 # ------------------ Showcase ------------------ #
@@ -483,9 +571,12 @@ class LoopScrollView(RelativeLayout):
 from kivy.uix.button import Button
 
 
-class LoopLabel(LoopEntry, Button):
-    def on_press(self):
-        print(self.text, "pressed")
+class LoopLabel(LoopEntry, Label):
+    pass
+
+
+class LoopButton(LoopEntry, Button):
+    pass
 
 
 __style = ("""
@@ -507,14 +598,15 @@ __style = ("""
             width:5
 """)
 
-from kivy.uix.scrollview import ScrollView
-
 
 class InfiniteScrollingScrollView(App):
     def build(self):
         root = RelativeLayout()
-        sv = LoopScrollView(size_hint=(0.5, 0.5), pos_hint={'center': (0.5, 0.5)}, viewclass=LoopLabel)
-        sv.data = [{'text': str(x)} for x in range(15)]
+        root.bind(on_touch_down=lambda x, y: print("-" * 10))
+        sv = LoopScrollView(
+            size_hint=(0.5, 0.5), pos_hint={'center': (0.5, 0.5)}, viewclass=LoopLabel, debug=False
+        )
+        sv.data = [{'text': str(x)} for x in range(10000000)]
         root.add_widget(sv)
         return root
 
